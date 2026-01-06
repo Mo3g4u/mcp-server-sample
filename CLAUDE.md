@@ -34,57 +34,92 @@ sakila-mcp-server/
 
 ## アーキテクチャ
 
-### LLMとMCPサーバーの役割分担
+### Intent-Based API設計
+
+このMCPサーバーはデータベーススキーマを非公開とし、ビジネス意図ベースのツールを提供する方式を採用。
 
 ```
 ユーザー（自然言語）
     ↓
-Claude（LLM）: 自然言語理解 → SQL生成
+Claude（LLM）: 自然言語理解 → ツール選択
     ↓
-MCPサーバー: SQL実行 → 結果返却
+MCPサーバー: 内部でSQL生成・実行 → 結果返却
     ↓
 Claude（LLM）: 結果を自然言語で整形
     ↓
 ユーザーへ回答
 ```
 
-- **LLM**: 自然言語処理、SQL生成、結果の要約
-- **MCPサーバー**: ツール定義の公開、クエリ実行
+**設計方針:**
+- **スキーマ非公開**: テーブル構造、カラム名、FK関係は一切公開しない
+- **ビジネス意図ベース**: 「映画を検索する」「顧客詳細を取得する」などの意図に対応
+- **パラメータ化クエリ**: SQLインジェクション対策としてすべてのユーザー入力は`%s`プレースホルダ経由
+- **入力検証**: rating, store_id等は許可値リストでチェック
 
-### スキーマ情報の提供方式
+### 提供ツール一覧（18ツール）
 
-LLMが効率的にSQLを生成できるよう、**ツール説明にスキーマを埋め込む方式**を採用。
+#### 映画検索・情報系
+| ツール | 説明 | 主要パラメータ |
+|--------|------|---------------|
+| `search_films` | 映画検索 | title, category, rating, actor_name, limit |
+| `get_film_details` | 映画詳細（出演者・在庫含む） | title |
+| `list_categories` | カテゴリ一覧 | なし |
+| `check_film_availability` | 在庫・貸出状況 | title, store_id |
+
+#### 顧客管理系
+| ツール | 説明 | 主要パラメータ |
+|--------|------|---------------|
+| `search_customers` | 顧客検索 | name, email, store_id, active_only |
+| `get_customer_details` | 顧客詳細（住所・履歴サマリー） | customer_id or email |
+
+#### レンタル業務系
+| ツール | 説明 | 主要パラメータ |
+|--------|------|---------------|
+| `get_customer_rentals` | レンタル履歴 | customer_id, status |
+| `get_overdue_rentals` | 延滞一覧 | store_id, days_overdue |
+
+#### 分析・レポート系（基本）
+| ツール | 説明 | 主要パラメータ |
+|--------|------|---------------|
+| `get_popular_films` | 人気ランキング | period, category, store_id |
+| `get_revenue_summary` | 売上サマリー | group_by, store_id |
+| `get_store_stats` | 店舗統計 | store_id |
+| `get_actor_filmography` | 俳優の出演作品 | actor_name |
+
+#### 顧客分析系
+| ツール | 説明 | 主要パラメータ |
+|--------|------|---------------|
+| `get_top_customers` | 優良顧客ランキング | metric(rentals/spending), period, limit |
+| `get_customer_segments` | 顧客セグメント分析 | なし（自動分類） |
+| `get_customer_activity` | 顧客アクティビティ分析 | period |
+
+#### 在庫・商品分析系
+| ツール | 説明 | 主要パラメータ |
+|--------|------|---------------|
+| `get_inventory_turnover` | 在庫回転率分析 | store_id, category |
+| `get_category_performance` | カテゴリ別パフォーマンス | period, store_id |
+| `get_underperforming_films` | 低稼働作品一覧 | days_not_rented, store_id |
+
+## セキュリティ
+
+### 実装済み対策
+
+- **パラメータ化クエリ**: 全ユーザー入力は`%s`プレースホルダー経由
+- **入力検証**: 許可値リストによるバリデーション
+- **数値制限**: limitは最大50件
+- **フィールド制限**: 返却JSONは必要フィールドのみ
+- **エラーメッセージ**: SQLエラー詳細は非公開
+
+### 入力検証定数
 
 ```python
-SAKILA_SCHEMA = """
-## 主要テーブル
-### actor - 俳優
-- actor_id (PK), first_name, last_name
-...
-"""
-
-Tool(
-    name="query",
-    description=f"SQLクエリを実行します。\n{SAKILA_SCHEMA}",
-    ...
-)
+VALID_RATINGS = {"G", "PG", "PG-13", "R", "NC-17"}
+VALID_STORES = {1, 2}
+VALID_RENTAL_STATUS = {"all", "active", "returned"}
+VALID_GROUP_BY = {"store", "category", "month", "staff"}
+VALID_PERIOD = {"all_time", "last_month", "last_week"}
+VALID_METRICS = {"rentals", "spending"}
 ```
-
-**この方式のメリット:**
-- LLMが即座にスキーマを認識（探索不要）
-- ツール呼び出し回数の削減
-- トークン消費と応答時間の最適化
-
-**トレードオフ:**
-- スキーマ変更時は`SAKILA_SCHEMA`定数の更新が必要
-- 動的スキーマには不向き（その場合はResources方式を検討）
-
-### スキーマ更新時のチェックリスト
-
-- [ ] `SAKILA_SCHEMA`定数を更新
-- [ ] テーブル名、カラム名、FK関係を確認
-- [ ] JOINパターンの例を更新
-- [ ] テストで動作確認
 
 ## 開発コマンド
 
@@ -156,15 +191,47 @@ uv run pytest -m "not integration" --cov=sakila_mcp
 async def list_tools() -> list[Tool]:
     return [
         Tool(
-            name="ツール名",
-            description="説明",
+            name="search_films",
+            description="映画を検索します。タイトル、カテゴリ、レーティング等で絞り込み可能。",
             inputSchema={
                 "type": "object",
-                "properties": {...},
-                "required": [...]
+                "properties": {
+                    "title": {"type": "string", "description": "タイトル（部分一致）"},
+                    "category": {"type": "string", "description": "カテゴリ名"},
+                    "rating": {"type": "string", "enum": ["G", "PG", "PG-13", "R", "NC-17"]},
+                    "limit": {"type": "integer", "maximum": 50, "default": 10}
+                }
             }
         )
     ]
+```
+
+### ビジネスロジック関数
+
+```python
+async def search_films(
+    title: str | None = None,
+    category: str | None = None,
+    rating: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> list[dict]:
+    """映画を検索する。"""
+    rating = validate_rating(rating)  # 入力検証
+    limit = validate_limit(limit)
+
+    sql = "SELECT ... FROM film f WHERE 1=1"
+    params: list[Any] = []
+
+    if title:
+        sql += " AND f.title LIKE %s"
+        params.append(f"%{title}%")
+
+    # ... その他の条件
+
+    sql += " LIMIT %s"
+    params.append(limit)
+
+    return await execute_query(sql, tuple(params))
 ```
 
 ### ツール実行
@@ -173,10 +240,18 @@ async def list_tools() -> list[Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
-        # 処理
-        return [TextContent(type="text", text=json.dumps(result))]
+        if name == "search_films":
+            result = await search_films(
+                title=arguments.get("title"),
+                category=arguments.get("category"),
+                rating=arguments.get("rating"),
+                limit=arguments.get("limit", DEFAULT_LIMIT),
+            )
+        # ... 他のツール
+
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
     except Exception as e:
-        return [TextContent(type="text", text=f"エラー: {str(e)}")]
+        return [TextContent(type="text", text="処理中にエラーが発生しました。")]
 ```
 
 ## テストパターン
@@ -190,7 +265,16 @@ class TestListTools:
     """list_tools関数のテスト"""
 
     async def test_returns_expected_count(self):
-        ...
+        tools = await list_tools()
+        assert len(tools) == 18
+
+class TestValidationFunctions:
+    """バリデーション関数のテスト"""
+
+    def test_validate_rating_valid(self):
+        for rating in VALID_RATINGS:
+            result = validate_rating(rating)
+            assert result == rating
 ```
 
 ### fixtures（conftest.py）
@@ -202,15 +286,19 @@ class TestListTools:
 ### DB接続のモック
 
 ```python
-async def test_example(self, mock_connection, mock_cursor):
-    mock_cursor.fetchall = AsyncMock(return_value=[{"id": 1}])
+async def test_search_films(self, mock_connection, mock_cursor):
+    mock_cursor.fetchall = AsyncMock(
+        return_value=[{"title": "Test Film", "category": "Action"}]
+    )
 
     with patch("sakila_mcp.server.get_connection") as mock_get_conn:
-        mock_get_conn.return_value.__aenter__ = AsyncMock(return_value=mock_connection)
-        mock_get_conn.return_value.__aexit__ = AsyncMock(return_value=None)
+        mock_get_conn.return_value = AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_connection),
+            __aexit__=AsyncMock(return_value=None),
+        )
 
-        result = await execute_query("SELECT * FROM actor")
-        assert result == [{"id": 1}]
+        result = await call_tool("search_films", {"title": "Test"})
+        assert "Test Film" in result[0].text
 ```
 
 ### 統合テスト
@@ -220,8 +308,11 @@ async def test_example(self, mock_connection, mock_cursor):
 ```python
 @pytest.mark.integration
 class TestIntegration:
-    async def test_with_real_db(self):
-        ...
+    async def test_search_films_with_real_db(self):
+        result = await call_tool("search_films", {"limit": 5})
+        import json
+        data = json.loads(result[0].text)
+        assert len(data) <= 5
 ```
 
 ## コーディング規約
@@ -229,23 +320,10 @@ class TestIntegration:
 - 型ヒント必須
 - 非同期処理は`async/await`
 - docstringはモジュール・クラス・公開関数に必須
-- SQLインジェクション対策：ユーザー入力は必ず検証
-- SELECT/SHOW/DESCRIBE以外のSQL実行禁止
-- エラーは`TextContent`で返す
+- パラメータ化クエリ必須（`%s`プレースホルダ使用）
+- 入力は必ず検証関数を通す
+- エラーは`TextContent`で返す（詳細なSQLエラーは非公開）
 - 1関数80行以内目安
-
-## セキュリティ
-
-### 実装済み対策
-
-- SQL文の種類チェック（SELECT/SHOW/DESCRIBE/EXPLAINのみ許可）
-- テーブル名の検証（`isidentifier()`）
-- バッククォートによるエスケープ
-
-### 追加時の注意
-
-- 書き込み操作を追加する場合はトランザクション管理必須
-- パラメータはプレースホルダ（`%s`）を使用
 
 ## DB接続情報
 
@@ -259,8 +337,10 @@ class TestIntegration:
 
 ## 拡張時のチェックリスト
 
+- [ ] ビジネスロジック関数を追加
 - [ ] `list_tools()`にツール定義追加
 - [ ] `call_tool()`に処理追加
+- [ ] 入力検証関数を追加（必要に応じて）
 - [ ] テストクラス追加（ユニット・統合）
 - [ ] README更新
 - [ ] `uv run ruff check .` パス
